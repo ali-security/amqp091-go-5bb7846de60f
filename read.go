@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"sync/atomic"
 	"time"
 )
 
@@ -53,6 +54,15 @@ func (r *reader) ReadFrame() (frame frame, err error) {
 	typ := scratch[0]
 	channel := binary.BigEndian.Uint16(scratch[1:3])
 	size := binary.BigEndian.Uint32(scratch[3:7])
+
+	if r.maxFrameSize != nil {
+		// max-frameHeaderSize is safe from underflow only because maxFrameSize,
+		// whenever nonzero, is always negotiateFrameSize's floor (frameMinSize,
+		// 4096) or higher — see the store at Connection.openTune.
+		if max := atomic.LoadUint32(r.maxFrameSize); max > 0 && size > (max-frameHeaderSize) {
+			return nil, ErrFrameTooLarge
+		}
+	}
 
 	switch typ {
 	case frameMethod:

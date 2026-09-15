@@ -49,7 +49,7 @@ func amqplainConfig() Config {
 func newServer(t *testing.T, serverIO, clientIO io.ReadWriteCloser) *server {
 	return &server{
 		T: t,
-		r: reader{serverIO},
+		r: reader{r: serverIO},
 		w: writer{serverIO},
 		S: serverIO,
 		C: clientIO,

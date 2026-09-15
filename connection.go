@@ -121,6 +121,12 @@ type Connection struct {
 	Locales    []string // Server locales
 
 	closed int32 // Will be 1 if the connection is closed, 0 otherwise. Should only be accessed as atomic
+
+	// maxFrameSize mirrors Config.FrameSize once negotiated via connection.tune,
+	// letting the reader goroutine reject over-sized frames before allocating
+	// memory for them. 0 means no limit is enforced yet (or none was negotiated).
+	// Should only be accessed as atomic.
+	maxFrameSize uint32
 }
 
 type readDeadliner interface {
@@ -701,7 +707,7 @@ func (c *Connection) dispatchClosed(f frame) {
 // handle on channel 0 (the connection channel).
 func (c *Connection) reader(r io.Reader) {
 	buf := bufio.NewReader(r)
-	frames := &reader{buf}
+	frames := &reader{r: buf, maxFrameSize: &c.maxFrameSize}
 	conn, haveDeadliner := r.(readDeadliner)
 
 	defer close(c.rpc)
@@ -981,10 +987,15 @@ func (c *Connection) openTune(config Config, auth Authentication) error {
 
 	c.m.Unlock()
 
-	// Frame size includes headers and end byte (len(payload)+8), even if
-	// this is less than FrameMinSize, use what the server sends because the
-	// alternative is to stop the handshake here.
-	c.Config.FrameSize = pick(config.FrameSize, int(tune.FrameMax))
+	// Frame size includes headers and end byte (len(payload)+8). Enforce the spec
+	// minimum floor of frameMinSize (4096 bytes) to prevent malicious servers
+	// from forcing extreme fragmentation and CPU overhead.
+	c.Config.FrameSize = negotiateFrameSize(config.FrameSize, int(tune.FrameMax))
+	// This is the only place maxFrameSize is written. reader.ReadFrame relies on
+	// any nonzero value here being >= frameMinSize (negotiateFrameSize's floor)
+	// to safely subtract frameHeaderSize without underflow — keep it that way if
+	// another write path is ever added.
+	atomic.StoreUint32(&c.maxFrameSize, uint32(c.Config.FrameSize))
 
 	// Save this off for resetDeadline()
 	c.Config.Heartbeat = time.Second * time.Duration(pick(
@@ -1096,4 +1107,12 @@ func pick(client, server int) int {
 		return max(client, server)
 	}
 	return min(client, server)
+}
+
+func negotiateFrameSize(client, server int) int {
+	size := pick(client, server)
+	if size > 0 && size < frameMinSize {
+		return frameMinSize
+	}
+	return size
 }
