@@ -1,27 +1,30 @@
 name: amqp091-go
 
 on:
-  push:
-    branches: ["*"]
-  pull_request:
-    branches: [main]
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional space-separated list of test names to run. Empty runs the full suite."
+        required: false
+        default: ""
 
 jobs:
   build-win32:
     name: build/test on windows-latest
     runs-on: windows-latest
+    timeout-minutes: 45
     strategy:
       fail-fast: true
       matrix:
         go-version: ['1.19', '1.20']
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-go@v3
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go-version }}
           check-latest: true
       - name: Cache installers
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           # Note: the cache path is relative to the workspace directory
           # https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows#using-the-cache-action
@@ -30,25 +33,93 @@ jobs:
       - name: Install and start RabbitMQ
         run: ./.ci/install.ps1
       - name: Tests
-        run: go test -cpu 1,2 -race -v -tags integration
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          if ( "$env:TEST_FILTER" -ne "" ) {
+            # The filter is a space-separated list of test names; go test -run
+            # wants a single alternation regex.
+            $runRegex = (("$env:TEST_FILTER" -split '\s+') | Where-Object { $_ -ne "" }) -join '|'
+            go test -cpu 1,2 -race -v -tags integration -run "$runRegex"
+          } else {
+            go test -cpu 1,2 -race -v -tags integration
+          }
   build-linux:
     name: build/test on ubuntu-latest
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     strategy:
       matrix:
         go-version: ['1.19', '1.20']
     services:
       rabbitmq:
-        image: rabbitmq
+        # Pinned to the broker version .ci/versions.json pins for the Windows
+        # leg, i.e. the one this release was tested against. The floating
+        # `rabbitmq` tag now resolves to 4.x, where a connection under a memory
+        # alarm no longer serves channel.open/queue.declare, so
+        # TestConnection_Close_WhenMemoryAlarmIsActive's helper hands the test a
+        # nil channel and the suite panics.
+        image: rabbitmq:3.11.10
         ports:
           - 5672:5672
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-go@v3
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go-version }}
           check-latest: true
+      - name: Build module zip
+        if: matrix.go-version == '1.19'
+        run: |
+          mkdir -p "${RUNNER_TEMP}/modzip" "${RUNNER_TEMP}/out"
+          cat > "${RUNNER_TEMP}/modzip/create_mod.go" <<'GOEOF'
+          package main
+          import (
+              "log"
+              "os"
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+          func main() {
+              if len(os.Args) != 5 {
+                  log.Fatal("usage: create_mod <module-path> <version> <source-dir> <output-zip>")
+              }
+              m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+              f, err := os.Create(os.Args[4])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+                  log.Fatal(err)
+              }
+              log.Printf("created module zip: %s", os.Args[4])
+          }
+          GOEOF
+          cd "${RUNNER_TEMP}/modzip"
+          go mod init example.com/modzip
+          go get golang.org/x/mod@v0.12.0
+          go run ./create_mod.go github.com/rabbitmq/amqp091-go v1.8.1 "${GITHUB_WORKSPACE}" "${RUNNER_TEMP}/out/v1.8.1.zip"
+          unzip -l "${RUNNER_TEMP}/out/v1.8.1.zip"
+      - name: Upload module zip
+        if: matrix.go-version == '1.19'
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v1.8.1.zip
+          if-no-files-found: error
       - name: Tests
         env:
           RABBITMQ_RABBITMQCTL_PATH: DOCKER:${{ job.services.rabbitmq.id }}
-        run: make check-fmt tests
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          if [ -n "${TEST_FILTER}" ]; then
+            # The filter is a space-separated list of test names; go test -run
+            # wants a single alternation regex. The `tests` target expands
+            # $(GO_TEST_FLAGS) unquoted into its shell recipe, so the regex has
+            # to carry its own quotes or the `|` becomes a pipeline.
+            run_regex=$(printf '%s' "${TEST_FILTER}" | tr -s '[:space:]' '|' | sed -e 's/^|//' -e 's/|$//')
+            make check-fmt tests GO_TEST_FLAGS="-run '${run_regex}'"
+          else
+            make check-fmt tests
+          fi
